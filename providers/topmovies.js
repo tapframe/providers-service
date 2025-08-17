@@ -3,9 +3,19 @@ const fs = require('fs').promises;
 const path = require('path');
 const cheerio = require('cheerio');
 const { CookieJar } = require('tough-cookie');
-const { wrapper } = require('axios-cookiejar-support');
 const { URLSearchParams, URL } = require('url');
 const FormData = require('form-data');
+const { findBestMatch } = require('string-similarity');
+const RedisCache = require('../utils/redisCache');
+
+// Dynamic import for axios-cookiejar-support
+let axiosCookieJarSupport = null;
+const getAxiosCookieJarSupport = async () => {
+  if (!axiosCookieJarSupport) {
+    axiosCookieJarSupport = await import('axios-cookiejar-support');
+  }
+  return axiosCookieJarSupport;
+};
 
 // --- Domain Fetching ---
 let topMoviesDomain = 'https://topmovies.rodeo'; // Fallback domain
@@ -20,7 +30,7 @@ async function getTopMoviesDomain() {
 
     try {
         console.log('[TopMovies] Fetching latest domain...');
-        const response = await axios.get('https://raw.githubusercontent.com/phisher98/TVVVV/refs/heads/main/domains.json', { timeout: 10000 });
+        const response = await makeRequest('https://raw.githubusercontent.com/phisher98/TVVVV/refs/heads/main/domains.json', { timeout: 10000 });
         if (response.data && response.data.topMovies) {
             topMoviesDomain = response.data.topMovies;
             domainCacheTimestamp = now;
@@ -35,6 +45,26 @@ async function getTopMoviesDomain() {
 }
 
 const TMDB_API_KEY = process.env.TMDB_API_KEY || "439c478a771f35c05022f9feabcca01c"; // Fallback to a public key
+
+// --- Proxy Configuration ---
+const TOPMOVIES_PROXY_URL = process.env.TOPMOVIES_PROXY_URL;
+if (TOPMOVIES_PROXY_URL) {
+    console.log(`[TopMovies] Using proxy: ${TOPMOVIES_PROXY_URL}`);
+} else {
+    console.log('[TopMovies] No proxy configured');
+}
+
+// Proxy wrapper function
+const makeRequest = (url, options = {}) => {
+    if (TOPMOVIES_PROXY_URL) {
+        const proxiedUrl = `${TOPMOVIES_PROXY_URL}${encodeURIComponent(url)}`;
+        console.log(`[TopMovies] Making proxied request to: ${url}`);
+        return axios.get(proxiedUrl, options);
+    } else {
+        console.log(`[TopMovies] Making direct request to: ${url}`);
+        return axios.get(url, options);
+    }
+};
 
 // --- Scraper Functions ---
 
@@ -58,7 +88,7 @@ async function searchMovies(query) {
         const searchUrl = `${baseUrl}/search/${encodeURIComponent(query)}`;
         console.log(`Searching: ${searchUrl}`);
         
-        const { data } = await axiosInstance.get(searchUrl);
+        const { data } = await makeRequest(searchUrl);
         const $ = cheerio.load(data);
 
         const results = [];
@@ -83,7 +113,7 @@ async function searchMovies(query) {
 async function extractDownloadLinks(moviePageUrl) {
     try {
         console.log(`\nExtracting download links from: ${moviePageUrl}`);
-        const { data } = await axiosInstance.get(moviePageUrl);
+        const { data } = await makeRequest(moviePageUrl);
         const $ = cheerio.load(data);
         
         const links = [];
@@ -137,7 +167,7 @@ async function extractDownloadLinks(moviePageUrl) {
 async function resolveLeechproLink(leechproUrl) {
     try {
         console.log(`\nResolving Leechpro link: ${leechproUrl}`);
-        const { data } = await axiosInstance.get(leechproUrl);
+        const { data } = await makeRequest(leechproUrl);
         const $ = cheerio.load(data);
 
         // Look for any of our supported link types in the timed content section first
@@ -145,7 +175,7 @@ async function resolveLeechproLink(leechproUrl) {
         
         const timedContent = $('.timed-content-client_show_0_5_0');
         if (timedContent.length > 0) {
-            const supportedLink = timedContent.find('a[href*="tech.unblockedgames.world"], a[href*="tech.creativeexpressionsblog.com"], a[href*="driveseed.org"], a[href*="driveleech.net"]').first();
+            const supportedLink = timedContent.find('a[href*="tech.unblockedgames.world"], a[href*="tech.creativeexpressionsblog.com"], a[href*="tech.examzculture.in"], a[href*="driveseed.org"], a[href*="driveleech.net"]').first();
             if (supportedLink.length > 0) {
                 resolvedLink = supportedLink.attr('href');
             }
@@ -153,7 +183,7 @@ async function resolveLeechproLink(leechproUrl) {
 
         // Fallback: look anywhere on the page for the links
         if (!resolvedLink) {
-            const allSupportedLinks = $('a[href*="tech.unblockedgames.world"], a[href*="tech.creativeexpressionsblog.com"], a[href*="driveseed.org"], a[href*="driveleech.net"]');
+            const allSupportedLinks = $('a[href*="tech.unblockedgames.world"], a[href*="tech.creativeexpressionsblog.com"], a[href*="tech.examzculture.in"], a[href*="driveseed.org"], a[href*="driveleech.net"]');
             if (allSupportedLinks.length > 0) {
                 resolvedLink = allSupportedLinks.first().attr('href');
             }
@@ -177,6 +207,9 @@ async function resolveSidToDriveleech(sidUrl) {
     console.log(`Resolving SID link: ${sidUrl}`);
     const { origin } = new URL(sidUrl);
     const jar = new CookieJar();
+    
+    // Get the wrapper function from dynamic import
+    const { wrapper } = await getAxiosCookieJarSupport();
     const session = wrapper(axios.create({
         jar,
         headers: {
@@ -305,12 +338,24 @@ async function tryInstantDownload($) {
             const formData = new FormData();
             formData.append('keys', keys);
 
-            const apiResponse = await axiosInstance.post(apiUrl, formData, {
-                headers: {
-                    ...formData.getHeaders(),
-                    'x-token': new URL(instantDownloadLink).hostname
-                }
-            });
+            let apiResponse;
+            if (TOPMOVIES_PROXY_URL) {
+                const proxiedApiUrl = `${TOPMOVIES_PROXY_URL}${encodeURIComponent(apiUrl)}`;
+                console.log(`[TopMovies] Making proxied POST request for Instant Download API to: ${apiUrl}`);
+                apiResponse = await axiosInstance.post(proxiedApiUrl, formData, {
+                    headers: {
+                        ...formData.getHeaders(),
+                        'x-token': new URL(instantDownloadLink).hostname
+                    }
+                });
+            } else {
+                apiResponse = await axiosInstance.post(apiUrl, formData, {
+                    headers: {
+                        ...formData.getHeaders(),
+                        'x-token': new URL(instantDownloadLink).hostname
+                    }
+                });
+            }
 
             if (apiResponse.data && apiResponse.data.url) {
                 let finalUrl = apiResponse.data.url;
@@ -370,7 +415,7 @@ async function tryResumeCloud($) {
         const resumeUrl = new URL(resumeLink, 'https://driveleech.net').href;
         console.log(`  [LOG] Found 'Resume Cloud' page link. Following to: ${resumeUrl}`);
         
-        const finalPageResponse = await axiosInstance.get(resumeUrl, { maxRedirects: 10 });
+        const finalPageResponse = await makeRequest(resumeUrl, { maxRedirects: 10 });
         const $$ = cheerio.load(finalPageResponse.data);
 
         // Corrected Selector: Look for the "Cloud Resume Download" button directly
@@ -397,17 +442,42 @@ async function tryResumeCloud($) {
     }
 }
 
+// Environment variable to control URL validation
+const URL_VALIDATION_ENABLED = process.env.DISABLE_URL_VALIDATION !== 'true';
+console.log(`[TopMovies] URL validation is ${URL_VALIDATION_ENABLED ? 'enabled' : 'disabled'}.`);
+
 // Validate if a video URL is working (not 404 or broken)
 async function validateVideoUrl(url, timeout = 10000) {
+    // Skip validation if disabled via environment variable
+    if (!URL_VALIDATION_ENABLED) {
+        console.log(`[TopMovies] URL validation disabled, skipping validation for: ${url.substring(0, 100)}...`);
+        return true;
+    }
+
     try {
         console.log(`[TopMovies] Validating URL: ${url.substring(0, 100)}...`);
-        const response = await axios.head(url, {
-            timeout,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Range': 'bytes=0-1' // Just request first byte to test
-            }
-        });
+        
+        // Use proxy for URL validation if enabled
+        let response;
+        if (TOPMOVIES_PROXY_URL) {
+            const proxiedUrl = `${TOPMOVIES_PROXY_URL}${encodeURIComponent(url)}`;
+            console.log(`[TopMovies] Making proxied HEAD request for validation to: ${url}`);
+            response = await axios.head(proxiedUrl, {
+                timeout,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'Range': 'bytes=0-1' // Just request first byte to test
+                }
+            });
+        } else {
+            response = await axios.head(url, {
+                timeout,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'Range': 'bytes=0-1' // Just request first byte to test
+                }
+            });
+        }
         
         // Check if status is OK (200-299) or partial content (206)
         if (response.status >= 200 && response.status < 400) {
@@ -428,7 +498,7 @@ async function resolveDriveleechLink(driveleechUrl) {
     try {
         console.log(`\nResolving Driveleech link: ${driveleechUrl}`);
         
-        const response = await axiosInstance.get(driveleechUrl, { maxRedirects: 10 });
+        const response = await makeRequest(driveleechUrl, { maxRedirects: 10 });
         let $ = cheerio.load(response.data);
 
         // Check for JavaScript redirect
@@ -439,7 +509,7 @@ async function resolveDriveleechLink(driveleechUrl) {
             const newPath = redirectMatch[1];
             const newUrl = new URL(newPath, 'https://driveleech.net/').href;
             console.log(`  JS redirect found. Following to: ${newUrl}`);
-            const newResponse = await axiosInstance.get(newUrl, { maxRedirects: 10 });
+            const newResponse = await makeRequest(newUrl, { maxRedirects: 10 });
             $ = cheerio.load(newResponse.data);
         }
 
@@ -504,8 +574,6 @@ async function resolveDriveleechLink(driveleechUrl) {
 // --- Caching Configuration ---
 const CACHE_ENABLED = process.env.DISABLE_CACHE !== 'true';
 const CACHE_DIR = process.env.VERCEL ? path.join('/tmp', '.topmovies_cache') : path.join(__dirname, '.cache', 'topmovies');
-const CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours
-
 // --- Caching Helper Functions ---
 const ensureCacheDir = async () => {
     if (!CACHE_ENABLED) return;
@@ -516,37 +584,30 @@ const ensureCacheDir = async () => {
     }
 };
 
+// Initialize Redis cache
+const redisCache = new RedisCache('TopMovies');
+
 const getFromCache = async (key) => {
     if (!CACHE_ENABLED) return null;
-    const cacheFile = path.join(CACHE_DIR, `${key}.json`);
-    try {
-        const data = await fs.readFile(cacheFile, 'utf-8');
-        const cached = JSON.parse(data);
-        if (Date.now() > cached.expiry) {
-            console.log(`[TopMovies Cache] EXPIRED for key: ${key}`);
-            await fs.unlink(cacheFile).catch(() => {});
-            return null;
-        }
-        console.log(`[TopMovies Cache] HIT for key: ${key}`);
-        return cached.data;
-    } catch (error) {
-        return null;
+    
+    // Try Redis cache first, then fallback to file system
+    const cachedData = await redisCache.getFromCache(key, '', CACHE_DIR);
+    if (cachedData) {
+        return cachedData.data || cachedData; // Support both new format (data field) and legacy format
     }
+    
+    return null;
 };
 
 const saveToCache = async (key, data) => {
     if (!CACHE_ENABLED) return;
-    const cacheFile = path.join(CACHE_DIR, `${key}.json`);
+    
     const cacheData = {
-        expiry: Date.now() + CACHE_TTL,
         data: data
     };
-    try {
-        await fs.writeFile(cacheFile, JSON.stringify(cacheData, null, 2), 'utf-8');
-        console.log(`[TopMovies Cache] SAVED for key: ${key}`);
-    } catch (error) {
-        console.error(`[TopMovies Cache] WRITE ERROR for key ${key}: ${error.message}`);
-    }
+    
+    // Save to both Redis and file system
+    await redisCache.saveToCache(key, cacheData, '', CACHE_DIR);
 };
 
 // Initialize cache directory
@@ -581,13 +642,18 @@ async function getTopMoviesStreams(tmdbId, mediaType = 'movie', season = null, e
   console.log(`[TopMovies] Attempting to fetch streams for TMDB ID: ${tmdbId}`);
 
   try {
-    const cacheKey = `topmovies_${tmdbId}`;
+    const cacheKey = `topmovies_final_v12_${tmdbId}`;
     
     // 1. Check cache for intermediate links
     let cachedLinks = await getFromCache(cacheKey);
-    if (cachedLinks) {
+    if (cachedLinks && cachedLinks.length > 0) {
         console.log(`[TopMovies Cache] Using ${cachedLinks.length} cached driveleech links.`);
     } else {
+        if (cachedLinks && cachedLinks.length === 0) {
+            console.log(`[TopMovies] Cache contains empty data for ${cacheKey}. Refetching from source.`);
+        } else {
+            console.log(`[TopMovies Cache] MISS for key: ${cacheKey}. Fetching from source.`);
+        }
         console.log(`[TopMovies Cache] MISS for key: ${cacheKey}. Fetching from source.`);
         // 2. Get TMDB info
         const tmdbUrl = `https://api.themoviedb.org/3/movie/${tmdbId}?api_key=${TMDB_API_KEY}`;
@@ -622,21 +688,26 @@ async function getTopMoviesStreams(tmdbId, mediaType = 'movie', season = null, e
         // Filter out 480p links before resolving
         const filteredLinks = downloadInfo.links.filter(link => !link.quality.includes('480p'));
 
-        // 4. Resolve to driveleech links
+        // 4. Resolve to final driveleech file page URLs (window.replace URLs)
         const resolutionPromises = filteredLinks.map(async (qualityLink) => {
-            const intermediateUrl = await resolveLeechproLink(qualityLink.url);
-            if (!intermediateUrl) return null;
+            try {
+                const intermediateUrl = await resolveLeechproLink(qualityLink.url);
+                if (!intermediateUrl) return null;
 
-            let finalUrl = intermediateUrl;
-            // If it's a SID link, resolve it first
-            if (intermediateUrl.includes('tech.unblockedgames.world') || intermediateUrl.includes('tech.creativeexpressionsblog.com')) {
-                finalUrl = await resolveSidToDriveleech(intermediateUrl);
+                let driveleechUrl = intermediateUrl;
+                // If it's a SID link, resolve it first
+                if (intermediateUrl.includes('tech.unblockedgames.world') || intermediateUrl.includes('tech.creativeexpressionsblog.com') || intermediateUrl.includes('tech.examzculture.in')) {
+                    driveleechUrl = await resolveSidToDriveleech(intermediateUrl);
+                }
+                
+                if (!driveleechUrl) return null;
+
+                console.log(`[TopMovies] Caching driveleech redirect URL: ${driveleechUrl}`);
+                return { ...qualityLink, driveleechRedirectUrl: driveleechUrl };
+            } catch (error) {
+                console.error(`[TopMovies] Error resolving ${qualityLink.quality}: ${error.message}`);
+                return null;
             }
-            
-            if(finalUrl) {
-                return { ...qualityLink, driveleechUrl: finalUrl };
-            }
-            return null;
         });
         
         cachedLinks = (await Promise.all(resolutionPromises)).filter(Boolean);
@@ -652,27 +723,84 @@ async function getTopMoviesStreams(tmdbId, mediaType = 'movie', season = null, e
         return [];
     }
 
-    // 6. Always fetch final stream URLs fresh from cached driveleech links
+    // 6. Process cached driveleech redirect URLs to get streaming links
     const streamPromises = cachedLinks.map(async (cachedLink) => {
       try {
-        console.log(`[TopMovies] Processing cached link: ${cachedLink.quality}`);
+        console.log(`[TopMovies] Processing cached driveleech redirect: ${cachedLink.quality}`);
         
-        const finalData = await resolveDriveleechLink(cachedLink.driveleechUrl);
-        if (!finalData || !finalData.url) return null;
+        // First, resolve the driveleech redirect URL to get the final file page URL
+        const response = await makeRequest(cachedLink.driveleechRedirectUrl, { maxRedirects: 10 });
+        let $ = cheerio.load(response.data);
 
-        const cleanQualityMatch = (cachedLink.quality || '').match(/(\\d{3,4}p|4K)/i);
-        const cleanQuality = cleanQualityMatch ? cleanQualityMatch[0] : (cachedLink.quality || 'UNK');
+        // Check for JavaScript redirect (window.location.replace)
+        const scriptContent = $('script').html();
+        const redirectMatch = scriptContent && scriptContent.match(/window\.location\.replace\("([^"]+)"\)/);
+
+        if (redirectMatch && redirectMatch[1]) {
+            const finalFilePageUrl = new URL(redirectMatch[1], 'https://driveleech.net/').href;
+            console.log(`[TopMovies] Resolved redirect to final file page: ${finalFilePageUrl}`);
+            
+            // Load the final file page
+            const finalResponse = await makeRequest(finalFilePageUrl, { maxRedirects: 10 });
+            $ = cheerio.load(finalResponse.data);
+        }
+
+        // Extract file size and title information
+        let sizeInfo = 'Unknown';
+        let movieTitle = null;
         
-        return {
-          name: `TopMovies - ${cleanQuality}`,
-          title: `${finalData.title || "Unknown Title"}\n${finalData.size || 'Unknown Size'}`,
-          url: finalData.url,
-          quality: cachedLink.quality, // Keep original for internal use if needed
-          size: finalData.size,
-          behaviorHints: {
-            bingeGroup: `topmovies-${cleanQuality}`
-          }
-        };
+        const sizeElement = $('li.list-group-item:contains("Size :")').text();
+        if (sizeElement) {
+            const sizeMatch = sizeElement.match(/Size\s*:\s*([0-9.,]+\s*[KMGT]B)/);
+            if (sizeMatch) {
+                sizeInfo = sizeMatch[1];
+            }
+        }
+
+        const nameElement = $('li.list-group-item:contains("Name :")');
+        if (nameElement.length > 0) {
+            movieTitle = nameElement.text().replace('Name :', '').trim();
+        } else {
+            const h5Title = $('div.card-header h5').clone().children().remove().end().text().trim();
+             if (h5Title) {
+                movieTitle = h5Title.replace(/\[.*\]/, '').trim();
+             }
+        }
+
+        // Try download methods to get final streaming URL
+        const downloadMethods = [
+            { name: 'Resume Cloud', func: tryResumeCloud },
+            { name: 'Instant Download', func: tryInstantDownload }
+        ];
+
+        for (const method of downloadMethods) {
+            try {
+                const finalUrl = await method.func($);
+                
+                if (finalUrl) {
+                    const isValid = await validateVideoUrl(finalUrl);
+                    if (isValid) {
+                        const cleanQualityMatch = (cachedLink.quality || '').match(/(\\d{3,4}p|4K)/i);
+                        const cleanQuality = cleanQualityMatch ? cleanQualityMatch[0] : (cachedLink.quality || 'UNK');
+                        
+                        return {
+                          name: `TopMovies - ${cleanQuality}`,
+                          title: `${movieTitle || "Unknown Title"}\n${sizeInfo}`,
+                          url: finalUrl,
+                          quality: cachedLink.quality,
+                          size: sizeInfo,
+                          behaviorHints: {
+                            bingeGroup: `topmovies-${cleanQuality}`
+                          }
+                        };
+                    }
+                }
+            } catch (error) {
+                console.log(`[TopMovies] ${method.name} failed: ${error.message}`);
+            }
+        }
+        
+        return null;
       } catch (error) {
         console.error(`[TopMovies] Error processing cached link ${cachedLink.quality}: ${error.message}`);
         return null;
@@ -692,4 +820,4 @@ async function getTopMoviesStreams(tmdbId, mediaType = 'movie', season = null, e
   }
 }
 
-module.exports = { getTopMoviesStreams }; 
+module.exports = { getTopMoviesStreams };
